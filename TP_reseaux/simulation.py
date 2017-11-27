@@ -1,14 +1,22 @@
 from random import randint
 
 # CONSTANTS
-# DATA FORMAT; BORDER|ADDR_S|ADDR_R|SEC1  |SIZE  |MESG
-# LENGTHS ===> BORD_S|===ADDR_S=== |SEC1_S|SIZE_S|MESG_S
+# DATA FORMAT; BORDER|ADDR_S|ADDR_R|SIZE  |MESG  |SEC1
+# LENGTHS ===> BORD_S|===ADDR_S=== |SIZE_S|MESG_S|SEC1_S <- variable
 BORDER = "01111110"
 BORD_S = len(BORDER)
 SIZE_S = 8
 ADDR_S = 4 * 2
-SEC1_S = 1
 
+DP_BLOCK_SIZE = 4
+
+CRC_GX = "11001"
+
+PBIT = "pb"
+DPBIT = "dpb"
+CRC = "crc"
+
+SEC = CRC
 
 # UTILITAIRE
 
@@ -23,8 +31,9 @@ def bin_str_to_int(s):
 
 # COUCHE 2 - intermediaire
 
-def add_identification(trnsm, recpt, msg):
-    return "".join([int_to_bin_str(trnsm, ADDR_S//2), int_to_bin_str(recpt, ADDR_S//2), msg.replace("o", "0").replace("i", "1")])
+def gen_identification(trnsm, recpt):
+    return "".join([int_to_bin_str(trnsm, ADDR_S//2),
+                    int_to_bin_str(recpt, ADDR_S//2)])
 
 
 def get_sender(mess):
@@ -47,47 +56,83 @@ def gen_parity_bit(msg):
     return str(int(msg.count('1') % 2))
 
 
-def gen_double_parity_bits(msg):
-    return str(int(msg.count('1') % 2)), str(int(msg.count('0') % 2))
+def gen_dparity_bits(msg):
+    from math import ceil
+    pbit_row = ""
+    pbit_col = ""
+    nb_rows = int(ceil(len(msg)/DP_BLOCK_SIZE))
+
+    for i in range(nb_rows):
+        if i + nb_rows > len(msg):
+            row = msg[i:]
+        else:
+            row = msg[i:i+nb_rows]
+        pbit_row += str(int(row.count('1') % 2))
+
+    for i in range(DP_BLOCK_SIZE):
+        col = ""
+        for j in range(nb_rows):
+            if j * nb_rows + i >= len(msg):
+                break
+            else:
+                col += msg[j*nb_rows + i]
+        pbit_col += str(int(col.count('1') % 2))
+
+    return pbit_row, pbit_col
 
 
-def get_parity_bit(msg):
-    return msg[BORD_S + ADDR_S: BORD_S + ADDR_S + SEC1_S]
+def get_dparity_size(msg_length):
+    from math import ceil
+    return int(ceil(msg_length/DP_BLOCK_SIZE) + DP_BLOCK_SIZE)
+
+def gen_crc(msg_bin, key='0'*len(CRC_GX)):
+    msg_bin += key
+    result = ""
+    for i in range(len(CRC_GX)):
+        msg_bin = int('0b'+msg_bin) ^ int('0b'+CRC_GX,2)
+    while len(msg_bin) >=len(CRC_GX):
+        XOR_str = msg_bin[0:len(CRC_GX)]
+        msg_bin = msg_bin[1:]
+        for i in range(len(string)):
+            msg_bin[i] = str(int(bool(string[i]) ^ bool(CRC_GX[i])))
+    return msg_bin
 
 
-def get_double_parity_bits(msg):
-    return list(msg[BORD_S + ADDR_S: BORD_S + ADDR_S + SEC1_S].split(''))
+# COUCHE 2 - DATA ERROR CORRECTION
 
-
-def parity_bit(bit, msg):
-    return (int(bit) + msg.count('1')) % 2 == 0
-
-
-def double_parity_bit(bit_0, bit_1, msg):
-    return (int(bit_0) + msg.count('0')) % 2 == 0 and (int(bit_1) + msg.count('1')) % 2 == 0
-
+def regen_hamming():
+    pass
 
 # COUCHE 2 - CODEX
 
 # cette fonction traduit un message en une trame/sequence de bits. Cette fonction est maintenant simple, mais elle est
 # insuffisante (elle ne permet pas de trouver le debut du message par exemple) le but de ce TP est de la completer.
 def couche2(message_from_sender, sender, receipter):
+    # generate identification
+    auth = gen_identification(sender, receipter)
+
     # translate message into binary data
     msg = message_from_sender.replace("o", "0").replace("i", "1")
-
-    # gen parity bit
-    p_bit = gen_parity_bit(msg)
 
     # get data length to binary
     size_b = int_to_bin_str(len(msg), SIZE_S)
 
-    # Combine data, length and parity
-    msg = "".join([p_bit,
-                   size_b,
-                   message_from_sender.replace("o", "0").replace("i", "1")])
-    # Returns Border + auth + whole message.
+    # gen security
+    if SEC == PBIT:
+        security = "".join(gen_parity_bit(msg))
+    elif SEC == DPBIT:
+        security = "".join(gen_dparity_bits(msg))
+    elif SEC == CRC:
+        security = "".join(gen_crc(msg))
+    else:
+        security = ""
+
+    # Returns Border + auth + whole message + security.
     return "".join([BORDER,
-                    add_identification(sender, receipter, msg)])
+                    auth,
+                    size_b,
+                    msg,
+                    security])
 
 
 # cette fonction traduit une sequence de bits en un message. Cette fonction est maintenant simple, mais elle est
@@ -98,16 +143,36 @@ def couche2R(message_from_sender, receipter):
     # Verify if the message is addressed to us (adresses)
     if is_adressed_to_me(message_from_sender[begin_i: begin_i+BORD_S+ADDR_S],
                          receipter):
-        # Get parity bit
-        p_b = get_parity_bit(message_from_sender[begin_i:])
+
+        data = message_from_sender[begin_i::]
+
         # get data length
-        MSG_S = bin_str_to_int(message_from_sender[begin_i+BORD_S+ADDR_S+SEC1_S:begin_i+BORD_S+ADDR_S+SEC1_S+SIZE_S])
+        MSG_S = bin_str_to_int(
+                    message_from_sender[begin_i+BORD_S+ADDR_S:
+                                        begin_i+BORD_S+ADDR_S+SIZE_S])
         # get data
-        data = message_from_sender[begin_i+BORD_S+ADDR_S+SEC1_S+SIZE_S:begin_i+BORD_S+ADDR_S+SEC1_S+SIZE_S+MSG_S]
-        if not parity_bit(p_b, data):
-            print("Parity bit incorrect: data corrupted")
-        return message_from_sender[begin_i + BORD_S + ADDR_S + SEC1_S+ SIZE_S:begin_i + BORD_S + ADDR_S + SEC1_S+ SIZE_S + MSG_S]\
-                .replace("0", "o").replace("1", "i")
+        msg = message_from_sender[begin_i+BORD_S+ADDR_S+SIZE_S:
+                                  begin_i+BORD_S+ADDR_S+SIZE_S+MSG_S]
+        # Get parity bit
+        if SEC == PBIT:
+            pbit = data[BORD_S + ADDR_S + SIZE_S + MSG_S:
+                        BORD_S + ADDR_S + SIZE_S + MSG_S + 1]
+            if pbit != gen_parity_bit(msg):
+                print("Parity bit incorrect: data corrupted")
+        elif SEC == DPBIT:
+            dp = data[BORD_S + ADDR_S + SIZE_S + MSG_S:
+                      BORD_S + ADDR_S + SIZE_S + MSG_S + get_dparity_size(MSG_S)]
+            dp_row, dp_col = dp[:-DP_BLOCK_SIZE:1], dp[-DP_BLOCK_SIZE::1]
+            if (dp_row, dp_col) != gen_dparity_bits(msg):
+                print("Double parity bits incorrect: data corrupted")
+        elif SEC == CRC:
+            crc = data[BORD_S + ADDR_S + SIZE_S + MSG_S:
+                       BORD_S + ADDR_S + SIZE_S + MSG_S + len(CRC_GX)]
+            if "0"*len(CRC_GX) != gen_crc(msg, crc):
+                print("CRC incorrect: data corrupted")
+        else:
+            pass
+        return msg.replace("0", "o").replace("1", "i")
     else:
         return "Message ignored"
 
@@ -204,7 +269,7 @@ def simulation(message_from_sender):
     cible_addr = 3
     signal_envoye = emission(message_from_sender, sender_addr, cible_addr)
     signal_sur_canal = transmission(signal_envoye)
-    signal_sur_canal = signal_swap_error(signal_sur_canal, 30)
+    #signal_sur_canal = signal_swap_error(signal_sur_canal, 30)
     return reception(signal_sur_canal, receipter_addr)
 
 message = "iiiioiiiooooioiioio"
@@ -222,7 +287,7 @@ for char_i in range(max(len_r, len_m)):
         #added chars
         print('+', end="")
     elif message[char_i] == result[char_i]:
-        print("_", end="")
+        print("x", end="")
     else:
         print(result[char_i], end="")
 
